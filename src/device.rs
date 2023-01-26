@@ -199,7 +199,7 @@ impl Device {
     /// The provided callback is called once the operation completes, and receives the actual
     /// length read (or status, on failure).
     #[cfg(feature = "callbacks")]
-    #[cfg_attr(doc, doc(cfg(feature = "callbacks")))]
+    #[cfg_attr(docrs, doc(cfg(feature = "callbacks")))]
     pub fn control_read_and_call_back(
         &mut self,
         request_type: RequestType,
