@@ -160,6 +160,6 @@ pub fn create_default_backend() -> UsbResult<Arc<dyn Backend>> {
 }
 
 #[cfg(target_os = "linux")]
-pub fn create_default_backend() -> UsbResult<Rc<dyn Backend>> {
-    Ok(Rc::new(linux::LinuxBackend::new()?))
+pub fn create_default_backend() -> UsbResult<Arc<dyn Backend>> {
+    Ok(Arc::new(linux::LinuxBackend::new()?))
 }
