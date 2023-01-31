@@ -1,5 +1,7 @@
 //! Every error that can occur in USRs.
 
+use std::io::Error as IoError;
+
 /// Alias to simplify implementing the results of USRs functions.
 pub type UsbResult<T> = Result<T, Error>;
 
@@ -52,6 +54,15 @@ pub enum Error {
     UnspecifiedOsError,
 }
 
+impl Error {
+    pub fn from_io_error(io_error: &IoError) -> Self {
+        match io_error.raw_os_error() {
+            Some(errno) => Error::OsError(errno as i64),
+            None => Error::UnspecifiedOsError,
+        }
+    }
+}
+
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         use Error::*;
@@ -85,3 +96,15 @@ impl std::fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+impl From<&IoError> for Error {
+    fn from(other: &IoError) -> Self {
+        Error::from_io_error(other)
+    }
+}
+
+impl From<IoError> for Error {
+    fn from(other: IoError) -> Self {
+        Error::from_io_error(&other)
+    }
+}
