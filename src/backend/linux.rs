@@ -1,8 +1,14 @@
 //! Core, low-level functionality for Linux.
 
-use std::{fs, os::unix::prelude::OsStrExt, time::Duration, path::Path};
+use std::{
+    fs, io::Error as IoError, io::ErrorKind as IoErrorKind, os::unix::prelude::OsStrExt,
+    path::Path, time::Duration,
+};
 
-use crate::{UsbResult, DeviceInformation, device::Device, Error};
+use log::{error, warn};
+use tap::tap::TapFallible;
+
+use crate::{device::Device, DeviceInformation, Error, UsbResult};
 
 use super::{Backend, BackendDevice};
 
@@ -21,19 +27,24 @@ impl Backend for LinuxBackend {
         let sysfs_usb_devices: Vec<_> = fs::read_dir("/sys/bus/usb/devices")
             .expect("Error reading /sys/bus/usb/devices")
             .filter(|entry| {
-                let entry = entry.as_ref().expect("Error reading entry in /sys/bus/usb/devices");
-                let metadata = entry.metadata().expect("Error getting metadata for entry in /sys/bus/usb/devices");
-                // As opposed to a host controller.
-                let is_device = entry
-                    .file_name()
-                    .as_bytes()[0]
-                    .is_ascii_digit();
-                let is_hub = entry
-                    .file_name()
-                    .as_bytes()
-                    .contains(&b':');
+                // Ignore anything that errors during the read.
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(e) => {
+                        error!("Error reading entry in /sys/bus/usb/devices/: {}", e);
+                        return false;
+                    }
+                };
 
-                //metadata.is_dir() && is_device && !is_hub
+                let metadata = entry
+                    .metadata()
+                    .expect("Error getting metadata for entry in /sys/bus/usb/devices");
+
+                // Also ignore host controllers, named like "usb1", and aren't real devices that can be talked to.
+                let is_device = entry.file_name().as_bytes()[0].is_ascii_digit();
+                let is_hub = entry.file_name().as_bytes().contains(&b':');
+
+                // FIXME: check if the symlink is to a directory.
                 metadata.is_symlink() && is_device && !is_hub
             })
             .collect();
@@ -41,40 +52,61 @@ impl Backend for LinuxBackend {
         let mut results: Vec<DeviceInformation> = Vec::with_capacity(sysfs_usb_devices.len());
 
         for dev in sysfs_usb_devices {
-            let dev = dev.expect("Error traversing /sys/bus/usb/devices");
+            let dev = dev.tap_err(|e| error!("Error traversing /sys/bus/usb/devices: {}", e))?;
 
             let full_path = dev.path();
 
-            let devnum: u64 = fs::read_to_string(full_path.join("devnum"))
-                .expect("Error reading USB device number from sysfs")
-                .parse()
-                .expect("USB device number in sysfs is invalid");
+            let devnum_path = full_path.join("devnum");
+            let devnum_str = read_sysfs_attr(&devnum_path).expect(&format!(
+                "Error reading USB devnum sysfs attr for device {}",
+                full_path.display(),
+            ));
+            let devnum: u64 = devnum_str.parse().expect(&format!(
+                "USB device number for device {} in sysfs is invalid: {}",
+                full_path.display(),
+                &devnum_str,
+            ));
 
-            let vendor_id = read_sysfs_attr(&full_path, "idVendor")
-                .map(|vid_str| u16::from_str_radix(&vid_str, 16)
-                    .expect(&format!("invalid attr idVendor for device {}", full_path.display()))
-                )?;
+            let vid_path = full_path.join("idVendor");
+            let vendor_id = read_sysfs_attr(&vid_path)
+                .tap_err(|e| error!("Error reading sysfs attr {}: {}", vid_path.display(), &e,))
+                .map(|vid_str| {
+                    u16::from_str_radix(&vid_str, 16).expect(&format!(
+                        "Device {} idVendor ({}) is not a number",
+                        full_path.display(),
+                        vid_str,
+                    ))
+                })?;
 
-            let product_id = read_sysfs_attr(&full_path, "idProduct")
-                .map(|pid_str| u16::from_str_radix(&pid_str, 16)
-                    .expect(&format!("invalid attr idProduct for device {}", full_path.display()))
-                )?;
+            let pid_path = full_path.join("idProduct");
+            let product_id = read_sysfs_attr(&pid_path)
+                .tap_err(|e| error!("Error reading sysfs attr {}: {}", pid_path.display(), &e,))
+                .map(|pid_str| {
+                    u16::from_str_radix(&pid_str, 16).expect(&format!(
+                        "Device {} idProduct ({}) is not a number",
+                        full_path.display(),
+                        pid_str,
+                    ))
+                })?;
 
-            let vendor = read_sysfs_attr(&full_path, "vendor")?;
-            let product = read_sysfs_attr(&full_path, "product")?;
+            let serial = read_sysfs_attr(&full_path.join("serial")).ok();
+            let vendor = read_sysfs_attr(&full_path.join("manufacturer")).ok();
+            let product = read_sysfs_attr(&full_path.join("product")).ok();
 
             let dev_info = DeviceInformation {
                 vendor_id,
                 product_id,
-                serial: todo!(),
-                vendor: todo!(),
-                product: todo!(),
+                serial,
+                vendor,
+                product,
                 backend_numeric_location: Some(devnum),
-                backend_string_location: todo!(),
+                backend_string_location: Some(full_path.to_string_lossy().to_string()),
             };
+
+            results.push(dev_info);
         }
 
-        todo!();
+        Ok(results)
     }
 
     fn open(&self, information: &DeviceInformation) -> UsbResult<Box<dyn BackendDevice>> {
@@ -214,26 +246,12 @@ impl Backend for LinuxBackend {
     }
 }
 
-fn read_sysfs_attr<N, A>(sysfs_node: N, attr_name: A) -> UsbResult<String>
-where
-    N: AsRef<Path>,
-    A: AsRef<Path>,
-{
-    let sysfs_node = sysfs_node.as_ref();
-    let attr_name = attr_name.as_ref();
+fn read_sysfs_attr<P: AsRef<Path>>(sysfs_attr: P) -> UsbResult<String> {
+    let sysfs_attr = sysfs_attr.as_ref();
 
     // Attempt to read the file from the filesystem...
-    let attr_result = fs::read_to_string(sysfs_node);
-    let attr_value = match attr_result {
-        Ok(v) => v,
-        Err(io_error) => match io_error.raw_os_error() {
-            // If it errored, and we have an error code, propagate that up.
-            Some(errno) => return Err(Error::OsError(errno as i64)),
+    let attr_result = fs::read_to_string(&sysfs_attr)?;
 
-            // Otherwise, consider the error unspecified.
-            None => return Err(Error::UnspecifiedOsError),
-        },
-    };
-
-    Ok(attr_value)
+    // Trim the trailing newline.
+    Ok(attr_result.trim().to_string())
 }

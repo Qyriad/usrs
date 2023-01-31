@@ -21,6 +21,7 @@ async = []
 
 [dependencies]
 log = "0.4.17"
+tap = "1.0.1"
 
 [target.'cfg(target_os="macos")'.dependencies]
 core-foundation-sys = "0.8.3"
