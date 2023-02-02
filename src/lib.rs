@@ -11,6 +11,7 @@ pub use convenience::create_read_buffer;
 
 pub mod backend;
 pub mod convenience;
+pub mod descriptor;
 pub mod device;
 pub mod error;
 pub mod host;

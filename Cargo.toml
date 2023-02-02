@@ -15,11 +15,13 @@ name = "lsusrs"
 name = "descriptor"
 
 [features]
-default = ["async"]
+default = ["async", "linux-sysfs"]
 callbacks = []
 async = []
+linux-sysfs = []
 
 [dependencies]
+binrw = "0.10.0"
 log = "0.4.17"
 tap = "1.0.1"
 
