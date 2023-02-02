@@ -6,7 +6,8 @@ use binrw::binrw;
 #[derive(Copy, Debug, Clone, PartialEq, Hash)]
 #[allow(non_snake_case)]
 #[binrw]
-#[brw(big)]
+// USB is little-endian [USB 2.0§8.1]
+#[brw(little)]
 pub struct DeviceDescriptor {
     pub bLength: u8,
     pub bDescriptorType: u8,
