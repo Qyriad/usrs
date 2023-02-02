@@ -1,6 +1,6 @@
 //! Every error that can occur in USRs.
 
-use std::io::Error as IoError;
+use std::io::{Error as IoError, ErrorKind as IoErrorKind};
 
 /// Alias to simplify implementing the results of USRs functions.
 pub type UsbResult<T> = Result<T, Error>;
@@ -56,9 +56,14 @@ pub enum Error {
 
 impl Error {
     pub fn from_io_error(io_error: &IoError) -> Self {
-        match io_error.raw_os_error() {
-            Some(errno) => Error::OsError(errno as i64),
-            None => Error::UnspecifiedOsError,
+
+        // Some errors can be translated directly.
+        match io_error.kind() {
+            IoErrorKind::PermissionDenied => Error::PermissionDenied,
+            _ => match io_error.raw_os_error() {
+                Some(errno) => Error::OsError(errno as i64),
+                None => Error::UnspecifiedOsError,
+            },
         }
     }
 }

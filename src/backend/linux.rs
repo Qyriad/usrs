@@ -17,10 +17,13 @@ use tap::tap::TapFallible;
 use crate::{
     descriptor::{self, DeviceDescriptor},
     device::Device,
-    DeviceInformation, Error, UsbResult,
+    DeviceInformation, Error, UsbResult, backend::linux::device::LinuxDevice,
 };
 
 use super::{Backend, BackendDevice};
+
+mod device;
+mod ioctl_c;
 
 /// Per-OS data for the Linux backend.
 #[derive(Debug)]
@@ -51,10 +54,24 @@ impl LinuxBackend {
             devfs_root: devfs_root.unwrap_or_else(|| PathBuf::from(Self::DEFAULT_DEVFS_ROOT)),
         })
     }
+
+    /// Packs Linux bus number and device number into a single u64, for storing into a
+    /// [DeviceInformation] struct.
+    fn pack_numeric_location(busnum: u32, devnum: u32) -> u64 {
+        ((busnum as u64) << 32) | (devnum as u64)
+    }
+
+    /// Unpacks the `backend_numeric_location` stored in a [DeviceInformation] struct into its
+    /// Linux bus number and device number.
+    fn unpack_numeric_Location(numeric_location: u64) -> (u32, u32) {
+        let busnum = (numeric_location >> 32) as u32;
+        let devnum = (numeric_location & 0x00000000_FFFFFFFF) as u32;
+
+        (busnum, devnum)
+    }
 }
 
 impl LinuxBackend {
-
     /// Enumerates devices via the Linux sysfs, usually at `/sys`.
     ///
     /// This is considerably faster than [enumerate_with_devfs], but is less likely to be available
@@ -179,7 +196,7 @@ impl LinuxBackend {
                 serial,
                 vendor,
                 product,
-                backend_numeric_location: Some(((busnum as u64) << 32) | (devnum as u64)),
+                backend_numeric_location: Some(Self::pack_numeric_location(busnum, devnum)),
                 backend_string_location: Some(full_path.to_string_lossy().to_string()),
             };
 
@@ -276,7 +293,6 @@ impl LinuxBackend {
         let mut results: Vec<DeviceInformation> = Vec::with_capacity(devfs_usb_nodes.len());
 
         for (busnum, devnum) in devfs_usb_nodes {
-
             // Now that we have a path to the USB device node, open the device in real-only mode
             // (no IOCTLs, so no general requests), and read the device file, which contains
             // the device's USB device descriptor binary (as well as the configuration descriptor
@@ -292,8 +308,7 @@ impl LinuxBackend {
             usb_file.read_to_end(&mut descriptor_chain).tap_err(|e| {
                 error!(
                     "Error reading descriptors from USB device {}: {}",
-                    &usb_file_name,
-                    &e,
+                    &usb_file_name, &e,
                 )
             })?;
 
@@ -304,8 +319,7 @@ impl LinuxBackend {
                 .tap_err(|e| {
                     error!(
                         "Error reading descriptor for device {}: {}",
-                        &usb_file_name,
-                        &e,
+                        &usb_file_name, &e,
                     )
                 })
                 .expect(&format!(
@@ -323,7 +337,7 @@ impl LinuxBackend {
                 serial: None,
                 vendor: None,
                 product: None,
-                backend_numeric_location: Some(((busnum as u64) << 32) | (devnum as u64)),
+                backend_numeric_location: Some(Self::pack_numeric_location(busnum, devnum)),
                 backend_string_location: None,
             };
 
@@ -335,12 +349,10 @@ impl LinuxBackend {
 }
 
 impl Backend for LinuxBackend {
-
     /// Enumerates USB devices on Linux, using the sysfs if the `linux-sysfs` feature is enabled
     /// and if the sysfs is available, otherwise using the devfs, which is considerably slower
     /// but less likely to be unmounted or permissions-unavailable.
     fn get_devices(&self) -> UsbResult<Vec<DeviceInformation>> {
-
         // Device information in Linux is split between the sysfs (/sys/bus/usb/) and the devfs
         // (/dev/bus/usb/).
         // If the sysfs feature is enabled, we'll try to read that, and fallback to the devfs if
@@ -360,7 +372,24 @@ impl Backend for LinuxBackend {
     }
 
     fn open(&self, information: &DeviceInformation) -> UsbResult<Box<dyn BackendDevice>> {
-        todo!()
+        let (busnum, devnum) = Self::unpack_numeric_Location(
+            information
+                .backend_numeric_location
+                .expect("Enumeration should have set backend numeric location"),
+        );
+
+        let usbdev_path = self
+            .devfs_root
+            .join(&format!("bus/usb/{:03}/{:03}", busnum, devnum));
+
+        let usbdev_file = File::options()
+            .read(true)
+            .write(true)
+            .open(&usbdev_path)?;
+
+        Ok(Box::new(LinuxDevice {
+            file: usbdev_file,
+        }))
     }
 
     fn release_kernel_driver(&self, device: &mut Device, interface: u8) -> UsbResult<()> {
