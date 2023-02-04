@@ -1,4 +1,4 @@
-use std::{fs::File, any::Any};
+use std::{any::Any, fs::File};
 
 use super::BackendDevice;
 

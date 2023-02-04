@@ -1,28 +1,39 @@
 //! Core, low-level functionality for Linux.
 
 use std::{
+    ffi::c_void,
     fs::{self, File},
     io::ErrorKind as IoErrorKind,
     io::{Error as IoError, Read},
     iter,
-    os::unix::prelude::OsStrExt,
+    os::unix::prelude::{AsRawFd, OsStrExt},
     path::{Path, PathBuf},
+    ptr,
     time::Duration,
 };
 
 use binrw::{io::Cursor, BinRead};
 use log::{error, warn};
+use nix::{
+    poll::{PollFd, PollFlags},
+    sys::select::FdSet,
+};
 use tap::tap::TapFallible;
 
 use crate::{
+    backend::linux::{
+        device::LinuxDevice,
+        ioctl_c::{__IncompleteArrayField, usbdevfs_urb, USBDEVFS_URB_TYPE_CONTROL},
+    },
     descriptor::{self, DeviceDescriptor},
     device::Device,
-    DeviceInformation, Error, UsbResult, backend::linux::device::LinuxDevice,
+    DeviceInformation, Error, UsbResult,
 };
 
 use super::{Backend, BackendDevice};
 
 mod device;
+mod ioctl;
 mod ioctl_c;
 
 /// Per-OS data for the Linux backend.
@@ -382,14 +393,9 @@ impl Backend for LinuxBackend {
             .devfs_root
             .join(&format!("bus/usb/{:03}/{:03}", busnum, devnum));
 
-        let usbdev_file = File::options()
-            .read(true)
-            .write(true)
-            .open(&usbdev_path)?;
+        let usbdev_file = File::options().read(true).write(true).open(&usbdev_path)?;
 
-        Ok(Box::new(LinuxDevice {
-            file: usbdev_file,
-        }))
+        Ok(Box::new(LinuxDevice { file: usbdev_file }))
     }
 
     fn release_kernel_driver(&self, device: &mut Device, interface: u8) -> UsbResult<()> {
@@ -438,7 +444,84 @@ impl Backend for LinuxBackend {
         target: &mut [u8],
         timeout: Option<Duration>,
     ) -> UsbResult<usize> {
-        todo!()
+        let backend_device: &LinuxDevice =
+            unsafe { device.backend_data().as_any().downcast_ref().unwrap() };
+
+        let dev_fd = backend_device.file.as_raw_fd();
+
+        // Unfortunately, the synchronous USBDEVFS_CONTROL ioctl completely disallows
+        // control transfers where wLength > PAGE_SIZE
+        // (https://elixir.bootlin.com/linux/v6.1/source/drivers/usb/core/devio.c#L1173).
+        // Some HCD drivers *also* have similar limitations on urb submission,
+        // but the increasingly common XHCD HCD does not.
+        // Either way, we have to implement this synchronous API in terms of Linux's
+        // asynchronous API in order to bypass this limitation.
+
+        // Unfortunately, this also introduces an additional limitation.
+        // USBDEVFS_SUBMITURB with USBDEVFS_URB_TYPE_CONTROL requires the setup data
+        // to be the first 8 bytes of the buffer.
+        // This means we can't just use the buffer provided by the user, so unfortunately
+        // we'll have to reallocate to account for the extra 8 bytes of setup data.
+        let mut buffer_for_urb = vec![0; target.len() + 8];
+
+        let req_len = &(target.len() as u16).to_le_bytes();
+
+        // For a control transfer, we need to fill the buffer with the setup data first.
+        buffer_for_urb[0] = request_type; // bmRequestType.
+        buffer_for_urb[1] = request_number; // bRequest.
+        buffer_for_urb[2..=3].copy_from_slice(&value.to_le_bytes()); // wValue.
+        buffer_for_urb[4..=5].copy_from_slice(&index.to_le_bytes()); // wIndex.
+        buffer_for_urb[6..=7].copy_from_slice(req_len);
+
+        // Now build the USB request block used for usbfs IOCTLs...
+        let mut urb_for_transfer = usbdevfs_urb {
+            type_: USBDEVFS_URB_TYPE_CONTROL as u8, //| 0x80,
+            endpoint: 0,
+            status: 0, // Out.
+            flags: 0,
+            buffer: buffer_for_urb.as_mut_ptr() as *mut c_void,
+            buffer_length: buffer_for_urb.len() as i32, // FIXME: explicitly error if truncated.
+            actual_length: 0,                           // OUT
+            start_frame: 0,                             // OUT
+            // Unnamed struct fields are not yet implemented in Rust:
+            // https://github.com/rust-lang/rust/issues/49804.
+            __bindgen_anon_1: ioctl_c::usbdevfs_urb__bindgen_ty_1 { stream_id: 0 }, // OUT.
+            error_count: 0,                                                         // OUT.
+            signr: 0, // No idea what this is.
+            usercontext: ptr::null_mut(),
+            iso_frame_desc: __IncompleteArrayField::new(),
+        };
+
+        // ...submit the URB to the kernel...
+        let submit_urb_res = unsafe { ioctl::usbdevfs_submiturb(dev_fd, &mut urb_for_transfer) };
+        match submit_urb_res {
+            Ok(_) => (),
+            Err(nix::Error::ENOENT) => return Err(Error::DeviceNotFound),
+            Err(nix::Error::EACCES) => return Err(Error::PermissionDenied),
+            Err(code) => return Err(Error::OsError(code as i64)),
+        };
+
+        // And wait for completion.
+        let mut _out: *mut c_void = ptr::null_mut();
+        let reapurb_res = unsafe { ioctl::usbdevfs_reapurb(dev_fd, &mut _out as *mut *mut c_void) };
+        match reapurb_res {
+            Ok(_) => (),
+            Err(nix::Error::ENOENT) => return Err(Error::DeviceNotFound),
+            Err(nix::Error::EACCES) => return Err(Error::PermissionDenied),
+            Err(code) => return Err(Error::OsError(code as i64)),
+        };
+
+        if urb_for_transfer.status < 0 {
+            match nix::Error::from_i32(-urb_for_transfer.status) {
+                nix::Error::EPIPE => return Err(Error::Stalled),
+                _ => return Err(Error::OsError(-urb_for_transfer.status as i64)),
+            }
+        }
+
+        // Now that the URB is completed and without errors, copy the data into the user's buffer.
+        target.copy_from_slice(&buffer_for_urb[8..]);
+
+        Ok(urb_for_transfer.actual_length as usize)
     }
 
     fn control_read_nonblocking(

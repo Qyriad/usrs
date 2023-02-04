@@ -56,7 +56,6 @@ pub enum Error {
 
 impl Error {
     pub fn from_io_error(io_error: &IoError) -> Self {
-
         // Some errors can be translated directly.
         match io_error.kind() {
             IoErrorKind::PermissionDenied => Error::PermissionDenied,

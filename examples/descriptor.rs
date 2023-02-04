@@ -10,8 +10,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Find some device we're interested in working with...
     let device_info = device(&DeviceSelector {
-        vendor_id: Some(0x1d50),
-        product_id: Some(0x615c),
+        vendor_id: Some(0x05e3),
+        product_id: Some(0x0610),
         ..Default::default()
     })?;
 
