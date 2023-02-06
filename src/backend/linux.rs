@@ -23,7 +23,7 @@ use tap::tap::TapFallible;
 use crate::{
     backend::linux::{
         device::LinuxDevice,
-        ioctl_c::{__IncompleteArrayField, usbdevfs_urb, USBDEVFS_URB_TYPE_CONTROL},
+        usbfs_c::{__IncompleteArrayField, usbdevfs_urb, USBDEVFS_URB_TYPE_CONTROL},
     },
     descriptor::{self, DeviceDescriptor},
     device::Device,
@@ -33,8 +33,8 @@ use crate::{
 use super::{Backend, BackendDevice};
 
 mod device;
-mod ioctl;
-mod ioctl_c;
+mod usbfs;
+mod usbfs_c;
 
 /// Per-OS data for the Linux backend.
 #[derive(Debug)]
@@ -485,7 +485,7 @@ impl Backend for LinuxBackend {
             start_frame: 0,                             // OUT
             // Unnamed struct fields are not yet implemented in Rust:
             // https://github.com/rust-lang/rust/issues/49804.
-            __bindgen_anon_1: ioctl_c::usbdevfs_urb__bindgen_ty_1 { stream_id: 0 }, // OUT.
+            __bindgen_anon_1: usbfs_c::usbdevfs_urb__bindgen_ty_1 { stream_id: 0 }, // OUT.
             error_count: 0,                                                         // OUT.
             signr: 0, // No idea what this is.
             usercontext: ptr::null_mut(),
@@ -493,7 +493,7 @@ impl Backend for LinuxBackend {
         };
 
         // ...submit the URB to the kernel...
-        let submit_urb_res = unsafe { ioctl::usbdevfs_submiturb(dev_fd, &mut urb_for_transfer) };
+        let submit_urb_res = unsafe { usbfs::usbdevfs_submiturb(dev_fd, &mut urb_for_transfer) };
         match submit_urb_res {
             Ok(_) => (),
             Err(nix::Error::ENOENT) => return Err(Error::DeviceNotFound),
@@ -503,7 +503,7 @@ impl Backend for LinuxBackend {
 
         // And wait for completion.
         let mut _out: *mut c_void = ptr::null_mut();
-        let reapurb_res = unsafe { ioctl::usbdevfs_reapurb(dev_fd, &mut _out as *mut *mut c_void) };
+        let reapurb_res = unsafe { usbfs::usbdevfs_reapurb(dev_fd, &mut _out as *mut *mut c_void) };
         match reapurb_res {
             Ok(_) => (),
             Err(nix::Error::ENOENT) => return Err(Error::DeviceNotFound),
