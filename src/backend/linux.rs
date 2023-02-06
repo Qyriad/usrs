@@ -13,10 +13,11 @@ use std::{
 };
 
 use binrw::{io::Cursor, BinRead};
-use log::{error, warn};
+use log::{error, info, trace, warn};
 use nix::{
     poll::{PollFd, PollFlags},
     sys::select::FdSet,
+    unistd::SysconfVar,
 };
 use tap::tap::TapFallible;
 
@@ -27,8 +28,10 @@ use crate::{
     },
     descriptor::{self, DeviceDescriptor},
     device::Device,
-    DeviceInformation, Error, UsbResult,
+    devices, DeviceInformation, Error, UsbResult,
 };
+
+use self::usbfs_c::usbdevfs_ctrltransfer;
 
 use super::{Backend, BackendDevice};
 
@@ -41,6 +44,7 @@ mod usbfs_c;
 pub struct LinuxBackend {
     sysfs_root: PathBuf,
     devfs_root: PathBuf,
+    page_size: usize,
 }
 
 impl LinuxBackend {
@@ -50,9 +54,14 @@ impl LinuxBackend {
     /// Initializes a Linux backend using sensible defaults. Use [with_paths] if you need more
     /// granularity.
     pub fn new() -> UsbResult<Self> {
+        let page_size = nix::unistd::sysconf(SysconfVar::PAGE_SIZE)
+            .ok()
+            .flatten()
+            .unwrap_or(4096) as usize;
         Ok(LinuxBackend {
             sysfs_root: PathBuf::from(Self::DEFAULT_SYSFS_ROOT),
             devfs_root: PathBuf::from(Self::DEFAULT_DEVFS_ROOT),
+            page_size,
         })
     }
 
@@ -60,9 +69,14 @@ impl LinuxBackend {
     /// by default).
     // FIXME: This constructor is not accessible currently as the entire module is not.
     pub fn with_paths(sysfs_root: Option<PathBuf>, devfs_root: Option<PathBuf>) -> UsbResult<Self> {
+        let page_size = nix::unistd::sysconf(SysconfVar::PAGE_SIZE)
+            .ok()
+            .flatten()
+            .unwrap_or(4096) as usize;
         Ok(LinuxBackend {
             sysfs_root: sysfs_root.unwrap_or_else(|| PathBuf::from(Self::DEFAULT_SYSFS_ROOT)),
             devfs_root: devfs_root.unwrap_or_else(|| PathBuf::from(Self::DEFAULT_DEVFS_ROOT)),
+            page_size,
         })
     }
 
@@ -357,6 +371,215 @@ impl LinuxBackend {
 
         Ok(results)
     }
+
+    /// Synchronously peforms a control read. Can only be used when wLength < PAGE_SIZE (usually
+    /// 4096).
+    fn usbfs_control_read_true_sync(
+        &self,
+        dev_fd: i32,
+        request_type: u8,
+        request_number: u8,
+        value: u16,
+        index: u16,
+        target: &mut [u8],
+        timeout: Option<Duration>,
+    ) -> UsbResult<usize> {
+        let transfer_timeout = match timeout {
+            Some(timeout) => {
+                if timeout.as_millis() > i32::MAX as u128 {
+                    warn!(
+                        "A wildly long timeout ({}s) was truncated to u32::MAX ({}s).",
+                        timeout.as_secs_f64(),
+                        Duration::from_millis(u32::MAX as u64).as_secs_f64(),
+                    );
+                    u32::MAX
+                } else {
+                    timeout.as_millis() as u32
+                }
+            }
+            None => 0u32,
+        };
+
+        let mut control_data = usbdevfs_ctrltransfer {
+            bRequestType: request_type,
+            bRequest: request_number,
+            wValue: value,
+            wIndex: index,
+            wLength: target.len() as u16,
+            timeout: transfer_timeout,
+            data: target.as_mut_ptr() as *mut c_void,
+        };
+
+        trace!(
+            "Performing true-synchronous control read: \
+            bmRequestType=0x{:02x} bRequest=0x{:02x} wValue=0x{:04x} wIndex=0x{:04x} wLength=0x{:04x}",
+            request_type, request_number, value, index, target.len(),
+        );
+
+        let control_res = unsafe { usbfs::usbdevfs_control(dev_fd, &mut control_data) };
+        info!(
+            "USBDEVFS_CONTROL ioctl ret = {}",
+            nix_result_to_code(&control_res)
+        );
+        let len_transferred = match control_res {
+            Ok(actual_len) => actual_len,
+            // FIXME: figure out what other errors should be hand-translated.
+            Err(nix::Error::ENOENT) => return Err(Error::DeviceNotFound),
+            Err(nix::Error::EACCES) => return Err(Error::PermissionDenied),
+            Err(nix::Error::EPIPE) => return Err(Error::Stalled),
+            Err(other) => return Err(Error::OsError(other as i64)),
+        };
+
+        Ok(len_transferred as usize)
+    }
+
+    fn usbfs_control_read_async_blocking(
+        &self,
+        dev_fd: i32,
+        request_type: u8,
+        request_number: u8,
+        value: u16,
+        index: u16,
+        target: &mut [u8],
+        timeout: Option<Duration>,
+    ) -> UsbResult<usize> {
+        // Unlike [usbfs_control_read_true_sync], this function can be used to make control
+        // transfers larger than PAGE_SIZE, but with an additional limitation. USBDEVFS_SUBMITURB
+        // with USBDEVFS_URB_TYPE_CONTROL requires the setup data to be the first 8 bytes of the
+        // buffer. This means we can't simply use the buffer provided by the user, so unfortunately
+        // we'll have to reallocate to accoutn for the extra 8 bytes of setup data, and then copy
+        // the results into the user's buffer after.
+
+        // Unfortunately, this also introduces an additional limitation.
+        // USBDEVFS_SUBMITURB with USBDEVFS_URB_TYPE_CONTROL requires the setup data
+        // to be the first 8 bytes of the buffer.
+        // This means we can't just use the buffer provided by the user, so unfortunately
+        // we'll have to reallocate to account for the extra 8 bytes of setup data.
+        let mut buffer_for_urb = vec![0; target.len() + 8];
+
+        let req_len = &(target.len() as u16).to_le_bytes();
+
+        // Copy the setup data into the beginning of the buffer for the URB.
+        buffer_for_urb[0] = request_type;
+        buffer_for_urb[1] = request_number;
+        buffer_for_urb[2..4].copy_from_slice(&value.to_le_bytes());
+        buffer_for_urb[4..6].copy_from_slice(&index.to_le_bytes());
+        buffer_for_urb[6..8].copy_from_slice(req_len);
+
+        // And create the USB request block used for usbfs IOCTLs, pointing it to our buffer.
+        let mut urb = usbdevfs_urb {
+            type_: USBDEVFS_URB_TYPE_CONTROL as u8,
+            endpoint: 0,
+            status: 0, // Out.
+            flags: 0,
+            buffer: buffer_for_urb.as_mut_ptr() as *mut c_void,
+            // Truncation is okay here -- wLength can't be larger than i32::MAX anyway.
+            buffer_length: buffer_for_urb.len() as i32,
+            actual_length: 0, // Out.
+            start_frame: 0,
+            // Unnamed struct fields are not yet implemented in Rust:
+            // https://github.com/rust-lang/rust/issues/49804.
+            __bindgen_anon_1: usbfs_c::usbdevfs_urb__bindgen_ty_1 { stream_id: 0 }, // OUT.
+            error_count: 0,                                                         // Out.
+            signr: 0, // No idea what this is.
+            usercontext: ptr::null_mut(),
+            iso_frame_desc: __IncompleteArrayField::new(),
+        };
+
+        trace!(
+            "Submitting asynchronous control read: \
+            bmRequestType=0x{:02x} bRequest=0x{:02x} wValue=0x{:04x} wIndex=0x{:04x} wLength=0x{:04x}",
+            request_type, request_number, value, index, target.len(),
+        );
+
+        // With the URB populated, submit it to the kernel.
+        let submit_urb_res = unsafe { usbfs::usbdevfs_submiturb(dev_fd, &mut urb) };
+        info!(
+            "USBDEVFS_SUBMITURB ioctl ret = {}",
+            nix_result_to_code(&submit_urb_res)
+        );
+        match submit_urb_res {
+            Ok(_) => (),
+            Err(nix::Error::ENOENT) => return Err(Error::DeviceNotFound),
+            Err(nix::Error::EACCES) => return Err(Error::PermissionDenied),
+            Err(code) => return Err(Error::OsError(code as i64)),
+        }
+
+        // With the URB submitted, we can now poll() for events to be ready, with our timeout.
+        let poll_flags = PollFlags::POLLOUT | PollFlags::POLLERR | PollFlags::POLLHUP;
+        let dev_pollfd = PollFd::new(dev_fd, poll_flags);
+        let poll_timeout = if let Some(timeout) = timeout {
+            if timeout.as_millis() > i32::MAX as u128 {
+                warn!(
+                    "A wildly long timeout ({}s) was truncated to i32::MAX ({}s).",
+                    timeout.as_secs_f64(),
+                    Duration::from_millis(i32::MAX as u64).as_secs_f64(),
+                );
+                i32::MAX
+            } else {
+                timeout.as_millis() as i32
+            }
+        } else {
+            // Signifies no timeout.
+            -1
+        };
+
+        // poll() returns errors for some cases where we just want to try again,
+        // notably EAGAIN or EINTR, so let's loop until it returns anything that's not that.
+        loop {
+            let poll_res = nix::poll::poll(&mut [dev_pollfd], poll_timeout);
+            match poll_res {
+                // We actually don't care which poll flag was triggered.
+                // We'll do transfer error handling in the next step.
+                Ok(_) => break,
+                Err(nix::Error::EAGAIN | nix::Error::EINTR) => continue,
+                Err(other) => {
+                    error!("poll() on device returned an unusual error: {}", other);
+                    return Err(Error::OsError(other as i64));
+                }
+            }
+        }
+
+        // With poll() done, we know that some events are ready for us, but the kernel hasn't
+        // updated our URB yet. So let's ask the kernel to reap any already-ready URBs.
+        let mut out_urb: *mut c_void = ptr::null_mut();
+        let reapurb_res =
+            unsafe { usbfs::usbdevfs_reapurbndelay(dev_fd, &mut out_urb as *mut *mut c_void) };
+        info!(
+            "USBFS_REAPURBNDELAY ioctl ret = {}",
+            nix_result_to_code(&reapurb_res)
+        );
+        match reapurb_res {
+            Ok(_) => (),
+            Err(nix::Error::ENOENT) => return Err(Error::DeviceNotFound),
+            Err(nix::Error::EACCES) => return Err(Error::PermissionDenied),
+            Err(code) => return Err(Error::OsError(code as i64)),
+        }
+
+        // Soundness check: the USBDEVFS_REAPURBNDELAY ioctl *should* set out_urb to non-null,
+        // but to avoid nasal-demons let's be double sure.
+        let out_urb = if !out_urb.is_null() {
+            unsafe { &*(out_urb as *mut usbdevfs_urb) }
+        } else {
+            unreachable!("poll() returned no error but out pointer is still null!");
+        };
+
+        // Now handle any error indicated in the URB's status.
+        info!("URB complete; status = {}", out_urb.status);
+        if out_urb.status < 0 {
+            match nix::Error::from_i32(-out_urb.status) {
+                // FIXME: figure out what other errors should be hand-translated.
+                nix::Error::EPIPE => return Err(Error::Stalled),
+                _ => return Err(Error::OsError(-out_urb.status as i64)),
+            }
+        }
+
+        // Finally, now that the URB is completed and without errors, copy the data back into the
+        // user's buffer, without the first 8 bytes to skip the setup data.
+        target.copy_from_slice(&buffer_for_urb[8..]);
+
+        Ok(out_urb.actual_length as usize)
+    }
 }
 
 impl Backend for LinuxBackend {
@@ -447,124 +670,37 @@ impl Backend for LinuxBackend {
         let backend_device: &LinuxDevice =
             unsafe { device.backend_data().as_any().downcast_ref().unwrap() };
 
-        let dev_fd = backend_device.file.as_raw_fd();
+        let dev_fd: i32 = backend_device.file.as_raw_fd();
 
-        // Unfortunately, the synchronous USBDEVFS_CONTROL ioctl completely disallows
-        // control transfers where wLength > PAGE_SIZE
-        // (https://elixir.bootlin.com/linux/v6.1/source/drivers/usb/core/devio.c#L1173).
-        // Some HCD drivers *also* have similar limitations on urb submission,
-        // but the increasingly common XHCD HCD does not.
-        // Either way, we have to implement this synchronous API in terms of Linux's
-        // asynchronous API in order to bypass this limitation.
-
-        // Unfortunately, this also introduces an additional limitation.
-        // USBDEVFS_SUBMITURB with USBDEVFS_URB_TYPE_CONTROL requires the setup data
-        // to be the first 8 bytes of the buffer.
-        // This means we can't just use the buffer provided by the user, so unfortunately
-        // we'll have to reallocate to account for the extra 8 bytes of setup data.
-        let mut buffer_for_urb = vec![0; target.len() + 8];
-
-        let req_len = &(target.len() as u16).to_le_bytes();
-
-        // For a control transfer, we need to fill the buffer with the setup data first.
-        buffer_for_urb[0] = request_type; // bmRequestType.
-        buffer_for_urb[1] = request_number; // bRequest.
-        buffer_for_urb[2..=3].copy_from_slice(&value.to_le_bytes()); // wValue.
-        buffer_for_urb[4..=5].copy_from_slice(&index.to_le_bytes()); // wIndex.
-        buffer_for_urb[6..=7].copy_from_slice(req_len);
-
-        // Now build the USB request block used for usbfs IOCTLs...
-        let mut urb_for_transfer = usbdevfs_urb {
-            type_: USBDEVFS_URB_TYPE_CONTROL as u8, //| 0x80,
-            endpoint: 0,
-            status: 0, // Out.
-            flags: 0,
-            buffer: buffer_for_urb.as_mut_ptr() as *mut c_void,
-            buffer_length: buffer_for_urb.len() as i32, // FIXME: explicitly error if truncated.
-            actual_length: 0,                           // OUT
-            start_frame: 0,                             // OUT
-            // Unnamed struct fields are not yet implemented in Rust:
-            // https://github.com/rust-lang/rust/issues/49804.
-            __bindgen_anon_1: usbfs_c::usbdevfs_urb__bindgen_ty_1 { stream_id: 0 }, // OUT.
-            error_count: 0,                                                         // OUT.
-            signr: 0, // No idea what this is.
-            usercontext: ptr::null_mut(),
-            iso_frame_desc: __IncompleteArrayField::new(),
-        };
-
-        // ...and submit the URB to the kernel.
-        let submit_urb_res = unsafe { usbfs::usbdevfs_submiturb(dev_fd, &mut urb_for_transfer) };
-        match submit_urb_res {
-            Ok(_) => (),
-            Err(nix::Error::ENOENT) => return Err(Error::DeviceNotFound),
-            Err(nix::Error::EACCES) => return Err(Error::PermissionDenied),
-            Err(code) => return Err(Error::OsError(code as i64)),
-        };
-
-        // With the URB submitted, we can now poll() until events are ready, with our timeout.
-        let poll_flags = PollFlags::POLLOUT | PollFlags::POLLERR | PollFlags::POLLHUP;
-        let dev_pollfd = PollFd::new(dev_fd, poll_flags);
-        let poll_timeout = if let Some(timeout) = timeout {
-            if timeout.as_millis() > i32::MAX as u128 {
-                warn!(
-                    "A wildly long timeout ({}s) was truncated to u32::MAX ({}s).",
-                    timeout.as_secs_f64(),
-                    Duration::from_millis(i32::MAX as u64).as_secs_f64(),
-                );
-                i32::MAX
-            } else {
-                timeout.as_millis() as i32
-            }
+        // The synchronous USBDEVFS_CONTROL IOCTL disallows control transfers where wLength >
+        // PAGE_SIZE (https://elixir.bootlin.com/linux/v6.1/source/drivers/usb/core/devio.c#L1173).
+        // Some HCD drivers *also* have a similar limitation on urb submission,
+        // but the increasingly common XHCI HCD does not.
+        // Either way, for control transfers of that size we have to use the asynchronous API to
+        // bypass USBDEVFS_CONTROL's limitation. This introduces a separate limitation that
+        // requires a secondary allocation, however. See [usbfs_control_read_async_blocking] for
+        // details.
+        if target.len() < self.page_size {
+            self.usbfs_control_read_true_sync(
+                dev_fd,
+                request_type,
+                request_number,
+                value,
+                index,
+                target,
+                timeout,
+            )
         } else {
-            -1
-        };
-
-        // poll() returns errors for some cases where we just want to try again,
-        // notably EAGAIN or EINTR, so let's loop until it returns anything that's
-        // not that.
-        loop {
-            let poll_res = nix::poll::poll(&mut [dev_pollfd], poll_timeout);
-            match poll_res {
-                // We actually don't care which poll flag was triggered.
-                // We'll do transfer error handling in the next step.
-                Ok(_) => break,
-                Err(nix::Error::EAGAIN | nix::Error::EINTR) => continue,
-                Err(other) => {
-                    error!("poll() on device returned an unusual error: {}", other);
-                    return Err(Error::OsError(other as i64));
-                },
-            }
-
+            self.usbfs_control_read_async_blocking(
+                dev_fd,
+                request_type,
+                request_number,
+                value,
+                index,
+                target,
+                timeout,
+            )
         }
-
-        // With poll() done, we know that some events are ready for us, but the kernel hasn't
-        // updated our URB yet. So let's ask the kernel to reap any already-ready URBs.
-        let mut out_urb: *mut c_void = ptr::null_mut();
-        let reapurb_res = unsafe { usbfs::usbdevfs_reapurbndelay(dev_fd, &mut out_urb as *mut *mut c_void) };
-        match reapurb_res {
-            Ok(_) => (),
-            Err(nix::Error::ENOENT) => return Err(Error::DeviceNotFound),
-            Err(nix::Error::EACCES) => return Err(Error::PermissionDenied),
-            Err(code) => return Err(Error::OsError(code as i64)),
-        };
-
-        let out_urb = if !out_urb.is_null() {
-            unsafe { &*(out_urb as *mut usbdevfs_urb) }
-        } else {
-            unreachable!("poll() returned no error but out pointer is still null!");
-        };
-
-        if out_urb.status < 0 {
-            match nix::Error::from_i32(-out_urb.status) {
-                nix::Error::EPIPE => return Err(Error::Stalled),
-                _ => return Err(Error::OsError(-out_urb.status as i64)),
-            }
-        }
-
-        // Now that the URB is completed and without errors, copy the data into the user's buffer.
-        target.copy_from_slice(&buffer_for_urb[8..]);
-
-        Ok(urb_for_transfer.actual_length as usize)
     }
 
     fn control_read_nonblocking(
@@ -659,4 +795,11 @@ fn read_sysfs_attr<P: AsRef<Path>>(sysfs_attr: P) -> UsbResult<String> {
 
     // Trim the trailing newline.
     Ok(attr_result.trim().to_string())
+}
+
+fn nix_result_to_code<T>(res: &nix::Result<T>) -> i32 {
+    match res {
+        Ok(_) => 0,
+        Err(e) => *e as i32,
+    }
 }
