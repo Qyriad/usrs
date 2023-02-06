@@ -492,7 +492,7 @@ impl Backend for LinuxBackend {
             iso_frame_desc: __IncompleteArrayField::new(),
         };
 
-        // ...submit the URB to the kernel...
+        // ...and submit the URB to the kernel.
         let submit_urb_res = unsafe { usbfs::usbdevfs_submiturb(dev_fd, &mut urb_for_transfer) };
         match submit_urb_res {
             Ok(_) => (),
@@ -501,9 +501,46 @@ impl Backend for LinuxBackend {
             Err(code) => return Err(Error::OsError(code as i64)),
         };
 
-        // And wait for completion.
-        let mut _out: *mut c_void = ptr::null_mut();
-        let reapurb_res = unsafe { usbfs::usbdevfs_reapurb(dev_fd, &mut _out as *mut *mut c_void) };
+        // With the URB submitted, we can now poll() until events are ready, with our timeout.
+        let poll_flags = PollFlags::POLLOUT | PollFlags::POLLERR | PollFlags::POLLHUP;
+        let dev_pollfd = PollFd::new(dev_fd, poll_flags);
+        let poll_timeout = if let Some(timeout) = timeout {
+            if timeout.as_millis() > i32::MAX as u128 {
+                warn!(
+                    "A wildly long timeout ({}s) was truncated to u32::MAX ({}s).",
+                    timeout.as_secs_f64(),
+                    Duration::from_millis(i32::MAX as u64).as_secs_f64(),
+                );
+                i32::MAX
+            } else {
+                timeout.as_millis() as i32
+            }
+        } else {
+            -1
+        };
+
+        // poll() returns errors for some cases where we just want to try again,
+        // notably EAGAIN or EINTR, so let's loop until it returns anything that's
+        // not that.
+        loop {
+            let poll_res = nix::poll::poll(&mut [dev_pollfd], poll_timeout);
+            match poll_res {
+                // We actually don't care which poll flag was triggered.
+                // We'll do transfer error handling in the next step.
+                Ok(_) => break,
+                Err(nix::Error::EAGAIN | nix::Error::EINTR) => continue,
+                Err(other) => {
+                    error!("poll() on device returned an unusual error: {}", other);
+                    return Err(Error::OsError(other as i64));
+                },
+            }
+
+        }
+
+        // With poll() done, we know that some events are ready for us, but the kernel hasn't
+        // updated our URB yet. So let's ask the kernel to reap any already-ready URBs.
+        let mut out_urb: *mut c_void = ptr::null_mut();
+        let reapurb_res = unsafe { usbfs::usbdevfs_reapurbndelay(dev_fd, &mut out_urb as *mut *mut c_void) };
         match reapurb_res {
             Ok(_) => (),
             Err(nix::Error::ENOENT) => return Err(Error::DeviceNotFound),
@@ -511,10 +548,16 @@ impl Backend for LinuxBackend {
             Err(code) => return Err(Error::OsError(code as i64)),
         };
 
-        if urb_for_transfer.status < 0 {
-            match nix::Error::from_i32(-urb_for_transfer.status) {
+        let out_urb = if !out_urb.is_null() {
+            unsafe { &*(out_urb as *mut usbdevfs_urb) }
+        } else {
+            unreachable!("poll() returned no error but out pointer is still null!");
+        };
+
+        if out_urb.status < 0 {
+            match nix::Error::from_i32(-out_urb.status) {
                 nix::Error::EPIPE => return Err(Error::Stalled),
-                _ => return Err(Error::OsError(-urb_for_transfer.status as i64)),
+                _ => return Err(Error::OsError(-out_urb.status as i64)),
             }
         }
 

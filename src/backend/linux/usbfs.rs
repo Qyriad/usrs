@@ -7,3 +7,4 @@ use super::usbfs_c::{usbdevfs_ctrltransfer, usbdevfs_urb};
 ioctl_readwrite!(usbdevfs_control, b'U', 0, usbdevfs_ctrltransfer);
 ioctl_read!(usbdevfs_submiturb, b'U', 10, usbdevfs_urb);
 ioctl_write_ptr!(usbdevfs_reapurb, b'U', 12, *mut c_void);
+ioctl_write_ptr!(usbdevfs_reapurbndelay, b'U', 13, *mut c_void);
