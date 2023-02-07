@@ -2,9 +2,10 @@ use std::os::raw::c_void;
 
 use nix::{ioctl_read, ioctl_readwrite, ioctl_write_ptr};
 
-use super::usbfs_c::{usbdevfs_ctrltransfer, usbdevfs_urb};
+use super::usbfs_c::{usbdevfs_ctrltransfer, usbdevfs_urb, usbdevfs_bulktransfer};
 
 ioctl_readwrite!(usbdevfs_control, b'U', 0, usbdevfs_ctrltransfer);
+ioctl_readwrite!(usbdevfs_bulk, b'U', 2, usbdevfs_bulktransfer);
 ioctl_read!(usbdevfs_submiturb, b'U', 10, usbdevfs_urb);
 ioctl_write_ptr!(usbdevfs_reapurb, b'U', 12, *mut c_void);
 ioctl_write_ptr!(usbdevfs_reapurbndelay, b'U', 13, *mut c_void);

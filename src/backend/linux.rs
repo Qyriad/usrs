@@ -28,7 +28,7 @@ use crate::{
     devices, DeviceInformation, Error, UsbResult,
 };
 
-use self::usbfs_c::usbdevfs_ctrltransfer;
+use self::usbfs_c::{usbdevfs_ctrltransfer, usbdevfs_bulktransfer};
 
 use super::{Backend, BackendDevice};
 
@@ -109,15 +109,23 @@ impl LinuxBackend {
 
     /// Unpacks the `backend_numeric_location` stored in a [DeviceInformation] struct into its
     /// Linux bus number and device number.
-    fn unpack_numeric_Location(numeric_location: u64) -> (u32, u32) {
+    fn unpack_numeric_location(numeric_location: u64) -> (u32, u32) {
         let busnum = (numeric_location >> 32) as u32;
         let devnum = (numeric_location & 0x00000000_FFFFFFFF) as u32;
 
         (busnum, devnum)
     }
-}
 
-impl LinuxBackend {
+    fn backend_device(device: &Device) -> &LinuxDevice {
+        unsafe {
+            device
+                .backend_data()
+                .as_any()
+                .downcast_ref()
+                .unwrap()
+        }
+    }
+
     /// Enumerates devices via the Linux sysfs, usually at `/sys`.
     ///
     /// This is considerably faster than [enumerate_with_devfs], but is less likely to be available
@@ -762,7 +770,7 @@ impl Backend for LinuxBackend {
     }
 
     fn open(&self, information: &DeviceInformation) -> UsbResult<Box<dyn BackendDevice>> {
-        let (busnum, devnum) = Self::unpack_numeric_Location(
+        let (busnum, devnum) = Self::unpack_numeric_location(
             information
                 .backend_numeric_location
                 .expect("Enumeration should have set backend numeric location"),
@@ -823,8 +831,7 @@ impl Backend for LinuxBackend {
         target: &mut [u8],
         timeout: Option<Duration>,
     ) -> UsbResult<usize> {
-        let backend_device: &LinuxDevice =
-            unsafe { device.backend_data().as_any().downcast_ref().unwrap() };
+        let backend_device: &LinuxDevice = Self::backend_device(&device);
 
         let dev_fd: i32 = backend_device.file.as_raw_fd();
 
@@ -884,13 +891,7 @@ impl Backend for LinuxBackend {
         data: &[u8],
         timeout: Option<Duration>,
     ) -> UsbResult<()> {
-        let backend_device: &LinuxDevice = unsafe {
-            device
-                .backend_data()
-                .as_any()
-                .downcast_ref()
-                .unwrap()
-        };
+        let backend_device: &LinuxDevice = Self::backend_device(&device);
 
         let dev_fd: i32 = backend_device.file.as_raw_fd();
 
@@ -949,7 +950,34 @@ impl Backend for LinuxBackend {
         buffer: &mut [u8],
         timeout: Option<Duration>,
     ) -> UsbResult<usize> {
-        todo!()
+
+        let backend_device: &LinuxDevice = Self::backend_device(&device);
+
+        let dev_fd: i32 = backend_device.file.as_raw_fd();
+
+        let mut transfer = usbdevfs_bulktransfer {
+            ep: endpoint as u32,
+            len: buffer.len() as u32,
+            timeout: timeout.map(|duration| truncate_duration_ms!(duration, u32)).unwrap_or(0),
+            data: buffer.as_mut_ptr() as *mut c_void,
+        };
+
+        trace!("Performing synchronous bulk read of length {}", buffer.len());
+
+        let bulk_res = unsafe { usbfs::usbdevfs_bulk(dev_fd, &mut transfer) };
+        info!(
+            "USBDEVFS_BULK ioctl ret = {}", nix_result_to_code(&bulk_res),
+        );
+
+        let len_transferred = match bulk_res {
+            Ok(len) => len,
+            // FIXME: figure out what other errors should be hand-translated.
+            Err(nix::Error::ENOENT) => return Err(Error::DeviceNotFound),
+            Err(nix::Error::EACCES) => return Err(Error::PermissionDenied),
+            Err(other) => return Err(Error::OsError(other as i64)),
+        };
+
+        Ok(len_transferred as usize)
     }
 
     fn write(
@@ -959,7 +987,33 @@ impl Backend for LinuxBackend {
         data: &[u8],
         timeout: Option<Duration>,
     ) -> UsbResult<()> {
-        todo!()
+        let backend_device = Self::backend_device(&device);
+
+        let dev_fd = backend_device.file.as_raw_fd();
+
+        let mut transfer = usbdevfs_bulktransfer {
+            ep: endpoint as u32,
+            len: data.len() as u32,
+            timeout: timeout.map(|duration| truncate_duration_ms!(duration, u32)).unwrap_or(0),
+            data: data.as_ptr() as *mut c_void,
+        };
+
+        trace!("Performing synchronous bulk write of length {}", data.len());
+
+        let bulk_res = unsafe { usbfs::usbdevfs_bulk(dev_fd, &mut transfer) };
+        info!(
+            "USBDEVFS_BULK ioctl ret = {}", nix_result_to_code(&bulk_res),
+        );
+
+        match bulk_res {
+            Ok(_len) => (),
+            // FIXME: figure out what other errors should be hand-translated.
+            Err(nix::Error::ENOENT) => return Err(Error::DeviceNotFound),
+            Err(nix::Error::EACCES) => return Err(Error::PermissionDenied),
+            Err(other) => return Err(Error::OsError(other as i64)),
+        }
+
+        Ok(())
     }
 
     fn read_nonblocking(
