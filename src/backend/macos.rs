@@ -9,13 +9,16 @@ use self::{
     callback::{delegate_iousb_callback, CallbackRefconType},
     device::{open_usb_device, MacOsDevice},
     endpoint::{address_for_in_endpoint, address_for_out_endpoint},
-    iokit::{leak_to_iokit, OsDevice, OsInterface},
+    iokit::{OsDevice, OsInterface},
     iokit_c::IOUSBDevRequest,
 };
 
 use super::{Backend, BackendDevice, DeviceInformation};
 use crate::{
-    backend::macos::iokit_c::IOUSBDevRequestTO, device::Device, error::UsbResult, ffi::DurationExt,
+    backend::macos::iokit_c::IOUSBDevRequestTO,
+    device::Device,
+    error::UsbResult,
+    ffi::{leak_to_c, DurationExt},
     Error, ReadBuffer, WriteBuffer,
 };
 
@@ -149,7 +152,7 @@ impl MacOsBackend {
             device.device_request_nonblocking_with_timeout(
                 &mut request_struct,
                 delegate_iousb_callback,
-                leak_to_iokit(callback),
+                leak_to_c(callback),
             )?;
             Ok(())
         } else {
@@ -168,7 +171,7 @@ impl MacOsBackend {
             device.device_request_nonblocking(
                 &mut request_struct,
                 delegate_iousb_callback,
-                leak_to_iokit(callback),
+                leak_to_c(callback),
             )?;
             Ok(())
         }
@@ -500,7 +503,7 @@ impl Backend for MacOsBackend {
                     data.as_mut_ptr() as *mut c_void,
                     data.len() as u32,
                     delegate_iousb_callback,
-                    leak_to_iokit(callback),
+                    leak_to_c(callback),
                     timeout.as_millis_truncated(),
                 )
             } else {
@@ -509,7 +512,7 @@ impl Backend for MacOsBackend {
                     data.as_mut_ptr() as *mut c_void,
                     data.len() as u32,
                     delegate_iousb_callback,
-                    leak_to_iokit(callback),
+                    leak_to_c(callback),
                 )
             }
         }
@@ -535,7 +538,7 @@ impl Backend for MacOsBackend {
                     data.as_ptr() as *mut c_void,
                     data.len() as u32,
                     delegate_iousb_callback,
-                    leak_to_iokit(callback),
+                    leak_to_c(callback),
                     timeout.as_millis_truncated(),
                 )
             } else {
@@ -544,7 +547,7 @@ impl Backend for MacOsBackend {
                     data.as_ptr() as *mut c_void,
                     data.len() as u32,
                     delegate_iousb_callback,
-                    leak_to_iokit(callback),
+                    leak_to_c(callback),
                 )
             }
         }

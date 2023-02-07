@@ -23,7 +23,7 @@ use io_kit_sys::{
     types::io_iterator_t, IOAsyncCallback1, IOObjectRelease, IORegistryEntrySearchCFProperty,
     CFSTR,
 };
-use log::{error, warn};
+use log::error;
 
 use super::iokit_c::{
     self, kIOUSBFindInterfaceDontCare, kIOUSBNoAsyncPortErr, kIOUSBPipeStalled,
@@ -931,19 +931,5 @@ pub(crate) fn get_iokit_string_device_property(
         }
 
         string_from_cf_string(raw_value)
-    }
-}
-/// Helper function that moves an object out of Rust's memory model, for use by IOKit.
-pub(crate) fn leak_to_iokit<T>(object: T) -> *mut c_void {
-    Box::into_raw(Box::new(object)) as *mut c_void
-}
-
-/// Helper function that recovers an object that was leaked with `leak_to_iokit`.
-pub(crate) fn unleak_from_iokit<T>(pointer: *mut c_void) -> T {
-    unsafe {
-        let typed = pointer as *mut T;
-        let boxed = Box::from_raw(typed);
-
-        *boxed
     }
 }

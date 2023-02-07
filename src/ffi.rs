@@ -1,8 +1,22 @@
-//! Internal helpers for working with FFIs.
+//! Internal helpers for working with FFI stuff.
 
 use std::time::Duration;
 
+use libc::c_void;
 use log::warn;
+
+pub(crate) fn leak_to_c<T: ?Sized>(object: Box<T>) -> *mut c_void {
+    Box::into_raw(Box::new(object)) as *mut c_void
+}
+
+pub(crate) fn unleak_from_c<T: ?Sized>(pointer: *mut c_void) -> Box<T> {
+    unsafe {
+        let typed = pointer as *mut Box<T>;
+        let boxed = Box::from_raw(typed);
+
+        *boxed
+    }
+}
 
 /// Extension trait for [Duration], mainly to help passing strongly-typed timeout values to the
 /// OS-expected `u32` or `i32` millisecond values with warnings for truncation.

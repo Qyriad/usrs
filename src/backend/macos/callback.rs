@@ -4,7 +4,7 @@ use std::ffi::c_void;
 
 use io_kit_sys::ret::IOReturn;
 
-use crate::{backend::macos::iokit::unleak_from_iokit, UsbResult};
+use crate::{ffi::unleak_from_c, UsbResult};
 
 use super::iokit::IOKitResultExtension;
 
@@ -18,7 +18,7 @@ pub(crate) unsafe extern "C" fn delegate_iousb_callback(
 ) {
     // Demangle our type information, since IOKit's mangled it real nicely for us.
     let total_length = total_length as usize;
-    let callback: Box<CallbackRefconType> = unleak_from_iokit(callback);
+    let callback: Box<CallbackRefconType> = unleak_from_c(callback);
 
     let callback_raw = Box::into_raw(callback);
     let callback = Box::from_raw(callback_raw);
