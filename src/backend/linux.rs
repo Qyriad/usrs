@@ -23,42 +23,20 @@ use crate::{
         device::LinuxDevice,
         usbfs_c::{__IncompleteArrayField, usbdevfs_urb, USBDEVFS_URB_TYPE_CONTROL},
     },
-    descriptor::{self, DeviceDescriptor},
     device::Device,
-    devices, DeviceInformation, Error, UsbResult,
+    ffi::OptDurationExt,
+    DeviceInformation, Error, UsbResult, descriptor::DeviceDescriptor,
 };
 
-use self::usbfs_c::{usbdevfs_ctrltransfer, usbdevfs_bulktransfer};
+use self::{
+    usbfs_c::{usbdevfs_bulktransfer, usbdevfs_ctrltransfer},
+};
 
 use super::{Backend, BackendDevice};
 
 mod device;
 mod usbfs;
 mod usbfs_c;
-
-
-/// Truncates a [Duration] to the maximum value of the specified type. Expects an expression that
-/// evaluates to a [Duration], and a type name. e.g.:
-/// ```
-/// truncate_duration_ms!(Duration::from_millis(500), i32);
-/// ```
-/// This function issues a warning with [warn!] if truncation occurred.
-macro_rules! truncate_duration_ms {
-    ($e:expr, $typ:ident) => {
-        if $e.as_millis() > $typ::MAX as u128 {
-            warn!(
-                "A wildly long timeout ({}s) was truncated to {}::MAX ({}s)",
-                $e.as_secs_f64(),
-                stringify!($typ),
-                Duration::from_millis($typ::MAX as u64).as_secs_f64(),
-            );
-            $typ::MAX
-        } else {
-            $e.as_millis() as $typ
-        }
-
-    }
-}
 
 /// Per-OS data for the Linux backend.
 #[derive(Debug)]
@@ -435,10 +413,9 @@ impl LinuxBackend {
         target: &mut [u8],
         timeout: Option<Duration>,
     ) -> UsbResult<usize> {
-        let transfer_timeout = match timeout {
-            Some(timeout) => truncate_duration_ms!(timeout, u32),
-            None => 0u32,
-        };
+
+        // USBDEVFS_CONTROL ioctl uses 0 as its sentinel for no timeout.
+        let transfer_timeout: u32 = timeout.as_millis_truncated_or(0);
 
         let mut control_data = usbdevfs_ctrltransfer {
             bRequestType: request_type,
@@ -571,10 +548,8 @@ impl LinuxBackend {
 
         // With the URB submitted, we can now poll() for events to be ready, with our timeout.
 
-        let poll_timeout = match timeout {
-            Some(timeout) => truncate_duration_ms!(timeout, i32),
-            None => -1, // Sentinal for no timeout.
-        };
+        // poll() uses -1 as its sentinel for no timeout.
+        let poll_timeout: i32 = timeout.as_millis_truncated_or(-1);
 
         let out_urb_ptr = self.block_to_complete_urb(dev_fd, poll_timeout)?;
         // FIXME: check if this is possible, e.g. with multiple threads.
@@ -618,10 +593,8 @@ impl LinuxBackend {
         timeout: Option<Duration>,
     ) -> UsbResult<usize> {
 
-        let transfer_timeout = match timeout {
-            Some(timeout) => truncate_duration_ms!(timeout, u32),
-            None => 0,
-        };
+        // USBDEVFS_CONTROL ioctl uses 0 as its sentinel for no timeout.
+        let transfer_timeout: u32 = timeout.as_millis_truncated_or(0);
 
         let mut control_data = usbdevfs_ctrltransfer {
             bRequestType: request_type,
@@ -713,10 +686,9 @@ impl LinuxBackend {
         }
 
         // With the URB submitted, we can now poll() for events to be ready, with our timeout.
-        let poll_timeout = match timeout {
-            Some(timeout) => truncate_duration_ms!(timeout, i32),
-            None => -1, // Sentinal for no timeout.
-        };
+
+        // poll() uses -1 as its sentinel for no timeout.
+        let poll_timeout: i32 = timeout.as_millis_truncated_or(-1);
 
         let out_urb_ptr = self.block_to_complete_urb(dev_fd, poll_timeout)?;
         // FIXME: check if this is possible, e.g. with multiple threads.
@@ -955,10 +927,13 @@ impl Backend for LinuxBackend {
 
         let dev_fd: i32 = backend_device.file.as_raw_fd();
 
+        // USBDEVFS_BULK ioctl uses 0 as its sentinel for no timeout.
+        let timeout_for_transfer: u32 = timeout.as_millis_truncated_or(0);
+
         let mut transfer = usbdevfs_bulktransfer {
             ep: endpoint as u32,
             len: buffer.len() as u32,
-            timeout: timeout.map(|duration| truncate_duration_ms!(duration, u32)).unwrap_or(0),
+            timeout: timeout_for_transfer,
             data: buffer.as_mut_ptr() as *mut c_void,
         };
 
@@ -991,10 +966,13 @@ impl Backend for LinuxBackend {
 
         let dev_fd = backend_device.file.as_raw_fd();
 
+        // USBDEVFS_BULK ioctl uses 0 as its sentinel for no timeout.
+        let timeout_for_transfer: u32 = timeout.as_millis_truncated_or(0);
+
         let mut transfer = usbdevfs_bulktransfer {
             ep: endpoint as u32,
             len: data.len() as u32,
-            timeout: timeout.map(|duration| truncate_duration_ms!(duration, u32)).unwrap_or(0),
+            timeout: timeout_for_transfer,
             data: data.as_ptr() as *mut c_void,
         };
 

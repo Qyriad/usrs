@@ -14,6 +14,7 @@ pub mod convenience;
 pub mod descriptor;
 pub mod device;
 pub mod error;
+mod ffi;
 pub mod host;
 pub mod request;
 

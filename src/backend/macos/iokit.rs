@@ -933,24 +933,6 @@ pub(crate) fn get_iokit_string_device_property(
         string_from_cf_string(raw_value)
     }
 }
-
-// Helper function that converts timeouts into the IOKit representation.
-pub(crate) fn to_iokit_timeout(timeout: Duration) -> u32 {
-    let mut timeout_ms = timeout.as_millis() as u32;
-
-    // Truncate this to a u32, since more would be a heckuva long time anyway.
-    if timeout.as_millis() > (u32::MAX as u128) {
-        warn!(
-            "A wildly long timeout ({}s) was truncated to u32::MAX ({}s).",
-            timeout.as_secs_f64(),
-            Duration::from_millis(u32::MAX as u64).as_secs_f64()
-        );
-        timeout_ms = u32::MAX;
-    }
-
-    timeout_ms
-}
-
 /// Helper function that moves an object out of Rust's memory model, for use by IOKit.
 pub(crate) fn leak_to_iokit<T>(object: T) -> *mut c_void {
     Box::into_raw(Box::new(object)) as *mut c_void

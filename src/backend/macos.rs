@@ -9,14 +9,14 @@ use self::{
     callback::{delegate_iousb_callback, CallbackRefconType},
     device::{open_usb_device, MacOsDevice},
     endpoint::{address_for_in_endpoint, address_for_out_endpoint},
-    iokit::{leak_to_iokit, to_iokit_timeout, OsDevice, OsInterface},
+    iokit::{leak_to_iokit, OsDevice, OsInterface},
     iokit_c::IOUSBDevRequest,
 };
 
 use super::{Backend, BackendDevice, DeviceInformation};
 use crate::{
-    backend::macos::iokit_c::IOUSBDevRequestTO, device::Device, error::UsbResult, Error,
-    ReadBuffer, WriteBuffer,
+    backend::macos::iokit_c::IOUSBDevRequestTO, device::Device, error::UsbResult, ffi::DurationExt,
+    Error, ReadBuffer, WriteBuffer,
 };
 
 mod callback;
@@ -76,7 +76,7 @@ impl MacOsBackend {
 
         // If we have a timeout, use the *TO request function.
         if let Some(timeout) = timeout {
-            let timeout_ms = to_iokit_timeout(timeout);
+            let timeout_ms: u32 = timeout.as_millis_truncated();
 
             // Populate the request-with-TimeOut structure, which will be passed to macOS.
             let mut request_struct = IOUSBDevRequestTO {
@@ -130,7 +130,7 @@ impl MacOsBackend {
 
         // If we have a timeout, use the *TO request function.
         if let Some(timeout) = timeout {
-            let timeout_ms = to_iokit_timeout(timeout);
+            let timeout_ms: u32 = timeout.as_millis_truncated();
 
             // Populate the request-with-TimeOut structure, which will be passed to macOS.
             let mut request_struct = IOUSBDevRequestTO {
@@ -454,7 +454,7 @@ impl Backend for MacOsBackend {
             let (pipe_ref, interface) = self.resources_for_in_endpoint(device, endpoint)?;
 
             if let Some(timeout) = timeout {
-                interface.read_with_timeout(pipe_ref, buffer, to_iokit_timeout(timeout))
+                interface.read_with_timeout(pipe_ref, buffer, timeout.as_millis_truncated())
             } else {
                 interface.read(pipe_ref, buffer)
             }
@@ -472,7 +472,7 @@ impl Backend for MacOsBackend {
             let (pipe_ref, interface) = self.resources_for_out_endpoint(device, endpoint)?;
 
             if let Some(timeout) = timeout {
-                interface.write_with_timeout(pipe_ref, data, to_iokit_timeout(timeout))
+                interface.write_with_timeout(pipe_ref, data, timeout.as_millis_truncated())
             } else {
                 interface.write(pipe_ref, data)
             }
@@ -501,7 +501,7 @@ impl Backend for MacOsBackend {
                     data.len() as u32,
                     delegate_iousb_callback,
                     leak_to_iokit(callback),
-                    to_iokit_timeout(timeout),
+                    timeout.as_millis_truncated(),
                 )
             } else {
                 interface.read_nonblocking(
@@ -536,7 +536,7 @@ impl Backend for MacOsBackend {
                     data.len() as u32,
                     delegate_iousb_callback,
                     leak_to_iokit(callback),
-                    to_iokit_timeout(timeout),
+                    timeout.as_millis_truncated(),
                 )
             } else {
                 interface.write_nonblocking(
