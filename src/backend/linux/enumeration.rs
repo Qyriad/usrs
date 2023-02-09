@@ -59,16 +59,9 @@ pub fn enumerate_with_sysfs<P: AsRef<Path>>(sysfs_root: P) -> UsbResult<Vec<Devi
                 }
             };
 
-            //// Ignore host controllers, named like "usb1", which aren't real devices that can be talked to.
-            //// Devices are named things like `3-5`, for "bus 3, port 5".
-            //// Host controllers are named things like `usb3`, for "bus 3".
-            //// Individual endpoints also have nodes in /sys/bus/usb/devices, which are named
-            //// like `3-5:1.0`, for "bus 3, port 5, configuration 1, interface 1` (interfaces
-            //// are 1-indexed in USB but 0-indexed in Linux).
-            //let is_device = entry.file_name().as_bytes()[0].is_ascii_digit();
             // FIXME: determine if root hubs should be enumerated.
             let is_device = true;
-            let is_interface = entry.file_name().as_bytes().contains(&b'.');
+            let is_interface = entry.file_name().as_bytes().contains(&b':');
 
             // FIXME: check if the symlink is to a directory.
             metadata.is_symlink() && is_device && !is_interface
