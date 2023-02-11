@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use log::{error, trace, warn};
+use log::{error, info, trace, warn};
 use nix::unistd::SysconfVar;
 
 use crate::{
@@ -106,7 +106,7 @@ impl Backend for LinuxBackend {
 
         let usbdev_file = File::options().read(true).write(true).open(&usbdev_path)?;
 
-        Ok(Box::new(LinuxDevice { file: usbdev_file }))
+        Ok(Box::new(LinuxDevice::new(usbdev_file)))
     }
 
     fn release_kernel_driver(&self, device: &mut Device, interface: u8) -> UsbResult<()> {
@@ -157,6 +157,23 @@ impl Backend for LinuxBackend {
     ) -> UsbResult<usize> {
         let backend_device: &LinuxDevice = Self::device_backend(&device);
 
+        // HACK: if this is a request for the configuration descriptor, intercept it and store the
+        // data for later.
+        let is_dir_in = (request_type & 0x80) == 0x80;
+        let is_type_std = (request_type & 0x60) == 0;
+        let is_recip_dev = (request_type & 0x1F) == 0;
+        let is_req_get_desc = request_number == 0x06;
+        let is_desc_config = (value >> 8) == 0x02;
+        dbg!(
+            is_dir_in,
+            is_type_std,
+            is_recip_dev,
+            is_req_get_desc,
+            is_desc_config
+        );
+        let caching = is_dir_in && is_type_std && is_recip_dev && is_req_get_desc && is_desc_config;
+        //info!("GET_DESCRIPTOR(type=Configuration) request detected. Caching descriptor chain.");
+
         // The synchronous USBDEVFS_CONTROL IOCTL disallows control transfers where
         // wLength > PAGE_SIZE
         // (https://elixir.bootlin.com/linux/v6.1/source/drivers/usb/core/devio.c#L1173).
@@ -166,7 +183,7 @@ impl Backend for LinuxBackend {
         // bypass USBDEVFS_CONTROL's limitation. This introduces a separate limitation that
         // requires a secondary allocation, however. See [control_async_blocking] for
         // details.
-        unsafe {
+        let ret = unsafe {
             if target.len() < self.page_size {
                 backend_device.control_sync(
                     request_type,
@@ -187,7 +204,17 @@ impl Backend for LinuxBackend {
                     Direction::In,
                 )
             }
+        };
+
+        if caching {
+            dbg!(&ret);
+            if let Ok(_len) = ret {
+                info!("GET_DESCRIPTOR(type=Configuration) request detected. Caching descriptor chain.");
+                backend_device.cache_descriptor_chain(target);
+            }
         }
+
+        ret
     }
 
     fn control_read_nonblocking(

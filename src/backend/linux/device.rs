@@ -1,5 +1,9 @@
-use std::{any::Any, fs::File, os::fd::AsRawFd, ptr, time::Duration};
+use std::{
+    any::Any, cell::Cell, collections::HashMap, fs::File, os::fd::AsRawFd, ptr, sync::RwLock,
+    time::Duration,
+};
 
+use binrw::BinRead;
 use libc::c_void;
 use log::{debug, error, log_enabled, trace, Level};
 use nix::poll::{PollFd, PollFlags};
@@ -12,6 +16,7 @@ use crate::{
             usbdevfs_urb__bindgen_ty_1, USBDEVFS_URB_TYPE_CONTROL,
         },
     },
+    descriptor::{ConfigurationDescriptor, EndpointDescriptor, InterfaceDescriptor},
     ffi::OptDurationExt,
     request::Direction,
     Error, UsbResult,
@@ -24,9 +29,82 @@ use super::BackendDevice;
 pub(crate) struct LinuxDevice {
     /// The "everything is a file" handle to a USB device on Linux.
     pub(crate) file: File,
+    /// Why a HashMap instead of a Vec? Well, descriptors can be sparsely indexed.
+    configs: RwLock<HashMap<u8, Configuration>>,
 }
 
 impl LinuxDevice {
+    pub fn new(file: File) -> Self {
+        Self {
+            file,
+            configs: RwLock::new(HashMap::new()),
+        }
+    }
+
+    pub fn cache_descriptor_chain(&self, configuration_descriptor_chain: &[u8]) -> UsbResult<()> {
+        let mut configs = self.configs.write().expect(&format!(
+            "Other thread poisoned RwLock for backend device {:?}",
+            self
+        ));
+
+        let mut reader = binrw::io::Cursor::new(configuration_descriptor_chain);
+        let config_desc = ConfigurationDescriptor::read(&mut reader).map_err(|e| {
+            error!(
+                "Could not parse GET_DESCRIPTOR response as a configuration descriptor: {}",
+                e,
+            );
+            Error::InvalidArgument
+        })?;
+
+        let mut interfaces: HashMap<u8, Interface> =
+            HashMap::with_capacity(config_desc.bNumInterfaces as usize);
+
+        for _interface in 0..config_desc.bNumInterfaces {
+            let interface_desc = InterfaceDescriptor::read(&mut reader).map_err(|e| {
+                error!(
+                    "Could not an interface descriptor in configuration descriptor chain: {}",
+                    e,
+                );
+                Error::InvalidArgument
+            })?;
+
+            let mut endpoints: HashMap<u8, Endpoint> =
+                HashMap::with_capacity(interface_desc.bNumEndpoints as usize);
+
+            for _endpoint in 0..interface_desc.bNumEndpoints {
+                let endpoint_desc = EndpointDescriptor::read(&mut reader)
+                    .map_err(|e| {
+                        error!("Could not parse an endpoint descriptor in a configuration descriptor chain: {}", e);
+                        Error::InvalidArgument
+                    })?;
+                endpoints.insert(
+                    endpoint_desc.bEndpointAddress,
+                    Endpoint {
+                        descriptor: endpoint_desc,
+                    },
+                );
+            }
+
+            interfaces.insert(
+                interface_desc.bInterfaceNumber,
+                Interface {
+                    descriptor: interface_desc,
+                    endpoints,
+                },
+            );
+        }
+
+        configs.insert(
+            config_desc.bConfigurationValue,
+            Configuration {
+                descriptor: config_desc,
+                interfaces,
+            },
+        );
+
+        Ok(())
+    }
+
     /// Performs an asynchronous control transfer, then blocks until it completes.
     /// Requires an additional allocation compared to [control_sync].
     ///
@@ -294,4 +372,21 @@ impl BackendDevice for LinuxDevice {
     fn as_any(&self) -> &dyn Any {
         self
     }
+}
+
+#[derive(Debug)]
+pub(crate) struct Configuration {
+    descriptor: ConfigurationDescriptor,
+    interfaces: HashMap<u8, Interface>,
+}
+
+#[derive(Debug)]
+pub(crate) struct Interface {
+    descriptor: InterfaceDescriptor,
+    endpoints: HashMap<u8, Endpoint>,
+}
+
+#[derive(Debug)]
+pub(crate) struct Endpoint {
+    descriptor: EndpointDescriptor,
 }
